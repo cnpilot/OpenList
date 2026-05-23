@@ -394,7 +394,8 @@ def process_non_bdmv_folders(save_path, name, tags, tmdb_api_key):
     log(f"【执行命令2-rclone-媒体转移】 {' '.join(rclone_command)}")
     try:
         subprocess.run(rclone_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        cleanup_command = ["find", "/home/boxbox/Emby", "-type", d, "-empty", "-delete"]
+        #  已修复笔误：d → "d"
+        cleanup_command = ["find", "/home/boxbox/Emby", "-type", "d", "-empty", "-delete"]
         subprocess.run(cleanup_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     except Exception as e:
         log(f"rclone执行异常，继续流程: {e}", "WARN")
