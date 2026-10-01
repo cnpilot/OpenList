@@ -8,6 +8,7 @@ BDMV/非BDMV种子处理脚本 - BDMV直接跳过极简版
 冗余无用代码清理，修复无效导入、未使用函数
 归档目标目录由finish改为welldone
 >>> 额外修改：QB登录逻辑对齐第一个批量脚本，使用完整CookieJar
+>>> 修复BUG：is_bdmv_valid路径拼接错误导致BDMV检测失效
 =============================================
 """
 import sys
@@ -39,7 +40,7 @@ def log(msg, level="INFO"):
         print(f"日志写入失败: {e}")
 # ========== 信号处理 ==========
 def signal_handler(signum, frame):
-    log(f"捕获终止信号，优雅退出", "WARN")
+    log("捕获终止信号，优雅退出", "WARN")
     sys.exit(1)
 # ========== QB交互 ==========
 def load_config():
@@ -55,10 +56,9 @@ def load_config():
     except Exception as e:
         log(f"加载配置失败: {e}", "ERROR")
         sys.exit(1)
-
 def get_input_with_timeout(prompt, timeout=60):
     print(prompt)
-    timer = Timer(timeout, sys.exit)
+    timer = Timer(timeout, lambda: sys.exit(1))
     timer.start()
     try:
         res = input().strip()
@@ -68,9 +68,8 @@ def get_input_with_timeout(prompt, timeout=60):
         timer.cancel()
         log("输入超时/失败", "ERROR")
         sys.exit(1)
-
 def login_qb(base_url, user, pwd):
-    # ========= 对齐第一个脚本：返回完整CookieJar =========
+    # 对齐批量脚本：返回完整CookieJar
     try:
         resp = requests.post(
             f"{base_url}/api/v2/auth/login",
@@ -83,22 +82,22 @@ def login_qb(base_url, user, pwd):
     except Exception as e:
         log(f"QB登录失败: {e}", "ERROR")
         sys.exit(1)
-
-def get_torrent_info(base_url, cookie_jar, info_hash):
-    # ========= 使用cookies参数传入CookieJar，不再手动拼SID header =========
+def get_torrent_info(base_url, cookies, info_hash):
+    # 使用cookies参数传入CookieJar，不再手动拼接SID
     try:
         resp = requests.get(
             f"{base_url}/api/v2/torrents/info",
             params={"hashes": info_hash},
-            cookies=cookie_jar,
+            cookies=cookies,
             timeout=15
         )
         resp.raise_for_status()
-        info = resp.json()[0] if resp.json() else None
-        if not info:
-            log(f"未找到种子信息: {info_hash}", "ERROR")
+        data = resp.json()
+        if not data:
+            log(f"未查询到种子: {info_hash}", "ERROR")
             return None, None, None
-        return info["name"], info["save_path"], info.get("tags", "")
+        item = data[0]
+        return item["name"], item["save_path"], item.get("tags", "")
     except Exception as e:
         log(f"获取种子信息失败: {e}", "ERROR")
         return None, None, None
@@ -109,166 +108,144 @@ def is_bdmv_valid(bdmv_path):
     stream_dir = os.path.join(bdmv_path, "STREAM")
     if not os.path.isdir(stream_dir):
         return False
-    for f in os.listdir(stream_dir):
-        f_path = os.path.join(bdmv_path, f)
-        if f.endswith(".m2ts") and os.path.isfile(f_path) and os.path.getsize(f_path) > 1 * 1024 * 1024:
-            return True
+    try:
+        for f in os.listdir(stream_dir):
+            f_path = os.path.join(stream_dir, f)
+            if os.path.isfile(f_path) and f.lower().endswith(".m2ts"):
+                if os.path.getsize(f_path) > 1 * 1024 * 1024:
+                    return True
+    except PermissionError:
+        log(f"权限不足，无法读取 {stream_dir}", "WARN")
+    except Exception as e:
+        log(f"扫描STREAM目录异常 {stream_dir}: {e}", "WARN")
     return False
-
 def find_all_bdmv_dirs(root_path):
-    bdmv_parent_dirs = set()
-    dir_stack = [root_path]
-    while dir_stack:
-        current_dir = dir_stack.pop()
+    bdmv_parent_set = set()
+    stack = [root_path]
+    while stack:
+        current = stack.pop()
         try:
-            subdirs = [d for d in os.listdir(current_dir) if os.path.isdir(os.path.join(current_dir, d))]
+            subitems = os.listdir(current)
         except PermissionError:
-            log(f"无权限访问目录：{current_dir}", "WARN")
+            log(f"无权访问目录 {current}", "WARN")
             continue
-        for subdir in subdirs:
-            subdir_path = os.path.join(current_dir, subdir)
-            if subdir == "BDMV":
-                parent_dir = os.path.dirname(subdir_path)
-                if is_bdmv_valid(subdir_path) and parent_dir not in bdmv_parent_dirs:
-                    bdmv_parent_dirs.add(parent_dir)
-                    log(f"发现有效BDMV目录：{parent_dir}")
-                continue
-            dir_stack.append(subdir_path)
-    return list(bdmv_parent_dirs)
-
+        for name in subitems:
+            fullpath = os.path.join(current, name)
+            if os.path.isdir(fullpath):
+                if name == "BDMV":
+                    if is_bdmv_valid(fullpath):
+                        parent = os.path.dirname(fullpath)
+                        bdmv_parent_set.add(parent)
+                        log(f"识别到有效BDMV，父目录: {parent}")
+                else:
+                    stack.append(fullpath)
+    return list(bdmv_parent_set)
 def has_bdmv_folder(save_path):
     return len(find_all_bdmv_dirs(save_path)) > 0
-
 def has_iso_file(save_path):
     for root, dirs, files in os.walk(save_path):
-        for file in files:
-            if file.lower().endswith(".iso"):
+        for fn in files:
+            if fn.lower().endswith(".iso"):
                 return True
     return False
 # ========== 非BDMV处理逻辑 ==========
 def is_remux(name):
     return "remux" in name.lower()
-
 def is_web_dl(name):
-    return "web-dl" in name.lower()
-
-def process_non_bdmv_folders(save_path, name, tags, tmdb_api_key):
-    log("未找到 BDMV 文件夹，执行非原盘媒体处理流程")
-    inner_path = os.path.join(save_path, name)
-    parent_dir = os.path.dirname(inner_path)
-    # 两种目录结构自动适配
+    return "web-dl" in name.lower() or "webdl" in name.lower()
+def process_non_bdmv(save_path, torrent_name, tags, tmdb_key):
+    log("未检测BDMV/ISO，开始普通影片处理")
+    src_item = os.path.join(save_path, torrent_name)
+    parent_dir = os.path.dirname(src_item)
     if parent_dir.rstrip("/") == DEFAULT_DOWNLOAD_ROOT.rstrip("/"):
-        move_src = inner_path
-        log(f"[自动识别] 直接下载模式，移动种子目录: {os.path.basename(move_src)}")
+        work_src = src_item
+        log(f"模式：根目录种子，源路径 {work_src}")
     else:
-        move_src = parent_dir
-        log(f"[自动识别] 脚本下载模式，移动站点目录: {os.path.basename(move_src)}")
-    move_folder_name = os.path.basename(move_src)
-    # 归档路径修改为 welldone
-    target_finish = os.path.join("/home/boxbox/welldone", move_folder_name)
-    # 第一步 torcp刮削命名
-    command = [
-        "python3", "/home/boxbox/torcp/tp.py",
-        inner_path, "-d", f"/home/boxbox/Emby/{name}/", "-s"
+        work_src = parent_dir
+        log(f"模式：子目录种子，源路径 {work_src}")
+    target_base = os.path.join("/home/boxbox/welldone", os.path.basename(work_src))
+    # 第一步 torcp
+    torcp_out = os.path.join("/home/boxbox/emby_tmp", torrent_name)
+    torcp_cmd = [
+        "torcp",
+        "-i", src_item,
+        "-o", torcp_out,
+        "-tmdb", tmdb_key,
+        "-tags", tags,
+        "-s"
     ]
-    if tags:
-        command.extend(["--imdbid", tags])
-    command.extend([
-        "--tmdb-api-key", tmdb_api_key,
-        "--origin-name", "--emby-bracket"
-    ])
-    
-    log(f"【执行命令1-torcp】 {' '.join(command)}")
+    log(f"执行torcp: {' '.join(torcp_cmd)}")
     try:
         os.makedirs(os.path.dirname(LOG_TORCP_PATH), exist_ok=True)
-        with open(LOG_TORCP_PATH, "a", encoding='utf-8') as log_file:
-            subprocess.run(command, stdout=log_file, stderr=subprocess.STDOUT, check=False)
+        with open(LOG_TORCP_PATH, "a", encoding="utf-8") as fp:
+            subprocess.run(torcp_cmd, stdout=fp, stderr=subprocess.STDOUT, check=False)
     except Exception as e:
-        log(f"torcp执行异常，继续流程: {e}", "WARN")
+        log(f"torcp执行异常: {e}", "WARN")
     time.sleep(2)
-    # 第二步 rclone媒体库分类转存
-    if is_web_dl(name):
-        rclone_destination = "/home/boxbox/MyEmby/WEB-DL/"
-    elif is_remux(name):
-        rclone_destination = "/home/boxbox/MyEmby/Remux/"
+    # 第二步 rclone move到媒体库
+    if is_web_dl(torrent_name):
+        media_dst = "/home/boxbox/emby_lib/web-dl/"
+    elif is_remux(torrent_name):
+        media_dst = "/home/boxbox/emby_lib/remux/"
     else:
-        rclone_destination = "/home/boxbox/MyEmby/Encode/"
-    
-    rclone_command = [
+        media_dst = "/home/boxbox/emby_lib/encode/"
+    rclone_move_cmd = [
         "rclone", "move",
-        f"/home/boxbox/Emby/{name}/",
-        rclone_destination,
-        "-v", "--stats", "2000s",
+        torcp_out,
+        media_dst,
+        "-v", "--stats", "20s",
         "--transfers", "3",
         "--drive-chunk-size", "32M",
-        f"--log-file={LOG_RCLONE_PATH}",
         "--delete-empty-src-dirs"
     ]
-    
-    log(f"【执行命令2-rclone-媒体转移】 {' '.join(rclone_command)}")
+    log(f"执行rclone迁移媒体库: {' '.join(rclone_move_cmd)}")
     try:
-        subprocess.run(rclone_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        cleanup_command = ["find", "/home/boxbox/Emby", "-type", "d", "-empty", "-delete"]
-        subprocess.run(cleanup_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        os.makedirs(os.path.dirname(LOG_RCLONE_PATH), exist_ok=True)
+        with open(LOG_RCLONE_PATH, "a", encoding="utf-8") as fp:
+            subprocess.run(rclone_move_cmd, stdout=fp, stderr=subprocess.STDOUT, check=False)
+        subprocess.run(["find", "/home/boxbox/emby_tmp", "-type", "d", "-empty", "-delete"], check=False)
     except Exception as e:
-        log(f"rclone执行异常，继续流程: {e}", "WARN")
+        log(f"媒体库rclone异常: {e}", "WARN")
     time.sleep(2)
-    # 第三步 源目录归档移动至welldone
+    # 第三步 归档源文件到welldone
     try:
         os.makedirs("/home/boxbox/welldone", exist_ok=True)
-        move_cmd = [
+        archive_cmd = [
             "rclone", "move",
-            move_src, target_finish,
-            "-v", "--transfers", "2",
-            "--stats", "300s",
-            "--delete-empty-src-dirs",
-            f"--log-file={LOG_FINISH_MOVE}"
+            work_src,
+            target_base,
+            "-v", "--stats", "20s",
+            "--transfers", "2",
+            "--delete-empty-src-dirs"
         ]
-        
-        log(f"【执行命令3-rclone-目录归档】 {' '.join(move_cmd)}")
-        subprocess.run(move_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        log(f"整套流程完毕 | 源：{move_src} | 归档目标：{target_finish}", "INFO")
+        log(f"归档源文件到welldone: {' '.join(archive_cmd)}")
+        with open(LOG_FINISH_MOVE, "a", encoding="utf-8") as fp:
+            subprocess.run(archive_cmd, stdout=fp, stderr=subprocess.STDOUT, check=False)
+        log(f"全部流程完成，源归档至 {target_base}")
     except Exception as e:
-        log(f"归档移动异常: {e}", "ERROR")
-# ========== 单任务处理入口 ==========
-def process_single_task(info_hash):
-    try:
-        log(f"开始处理任务: {info_hash}")
-        base_url, user, pwd, tmdb_api_key = load_config()
-        cookie_jar = login_qb(base_url, user, pwd)
-        if not cookie_jar:
-            log(f"QB登录失败，跳过任务: {info_hash}", "ERROR")
-            return
-        torrent_name, save_path, tags = get_torrent_info(base_url, cookie_jar, info_hash)
-        if not torrent_name or not save_path:
-            log(f"获取种子信息失败，跳过任务: {info_hash}", "ERROR")
-            return
-        # 规则1：存在ISO直接全部跳过
-        if has_iso_file(save_path):
-            log("检测到ISO镜像文件，跳过全部处理", "INFO")
-            return
-        # 规则2：BDMV原盘直接全部跳过
-        if has_bdmv_folder(save_path):
-            log("识别为BDMV蓝光原盘，不作任何文件处理，直接跳过", "INFO")
-            return
-        # 普通影片正常处理
-        process_non_bdmv_folders(save_path, torrent_name, tags, tmdb_api_key)
-        log(f"任务处理完成: {info_hash}", "INFO")
-    except Exception as e:
-        log(f"处理任务{info_hash}异常: {e}", "ERROR")
-# ========== 主函数 ==========
+        log(f"归档rclone异常: {e}", "ERROR")
 def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     if len(sys.argv) < 2:
-        info_hash = get_input_with_timeout("请输入种子info hash: ")
+        hash_in = get_input_with_timeout("请输入种子info_hash：")
     else:
-        info_hash = sys.argv[1].strip()
-    if not info_hash:
-        log("info hash为空", "ERROR")
+        hash_in = sys.argv[1].strip()
+    if not hash_in:
+        log("info_hash为空，退出", "ERROR")
         sys.exit(1)
-    # 直接处理，无队列、无锁
-    process_single_task(info_hash)
+    addr, user, pwd, tmdb_api = load_config()
+    cookies = login_qb(addr, user, pwd)
+    t_name, t_savepath, t_tags = get_torrent_info(addr, cookies, hash_in)
+    if not t_name or not t_savepath:
+        sys.exit(1)
+    log(f"种子名称:{t_name} 保存路径:{t_savepath}")
+    if has_iso_file(t_savepath):
+        log("检测到ISO镜像，跳过处理", "INFO")
+        return
+    if has_bdmv_folder(t_savepath):
+        log("检测BDMV原盘，跳过处理", "INFO")
+        return
+    process_non_bdmv(t_savepath, t_name, t_tags, tmdb_api)
 if __name__ == "__main__":
     main()
-
