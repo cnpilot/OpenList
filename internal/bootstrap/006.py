@@ -10,6 +10,7 @@ BDMV/非BDMV种子处理脚本 - BDMV直接跳过极简版
 >>> 额外修改：QB登录逻辑对齐第一个批量脚本，使用完整CookieJar
 >>> 修复BUG：is_bdmv_valid路径拼接错误导致BDMV检测失效
 >>> 优化：m2ts后缀大小写兼容；归档日志变量名同步welldone
+>>> 增加：还原try-except捕获STREAM读取异常，防止脚本直接崩溃
 =============================================
 """
 import sys
@@ -108,10 +109,16 @@ def is_bdmv_valid(bdmv_path):
     stream_dir = os.path.join(bdmv_path, "STREAM")
     if not os.path.isdir(stream_dir):
         return False
-    for f in os.listdir(stream_dir):
-        f_path = os.path.join(stream_dir, f)
-        if f.lower().endswith(".m2ts") and os.path.isfile(f_path) and os.path.getsize(f_path) > 1 * 1024 * 1024:
-            return True
+    try:
+        for f in os.listdir(stream_dir):
+            f_path = os.path.join(stream_dir, f)
+            if os.path.isfile(f_path) and f.lower().endswith(".m2ts"):
+                if os.path.getsize(f_path) > 1 * 1024 * 1024:
+                    return True
+    except PermissionError:
+        log(f"权限不足，无法读取 {stream_dir}", "WARN")
+    except Exception as e:
+        log(f"扫描STREAM目录异常 {stream_dir}: {e}", "WARN")
     return False
 def find_all_bdmv_dirs(root_path):
     bdmv_parent_dirs = set()
@@ -171,7 +178,7 @@ def process_non_bdmv_folders(save_path, name, tags, tmdb_api_key):
         "--tmdb-api-key", tmdb_api_key,
         "--origin-name", "--emby-bracket"
     ])
-    
+
     log(f"【执行命令1-torcp】 {' '.join(command)}")
     try:
         os.makedirs(os.path.dirname(LOG_TORCP_PATH), exist_ok=True)
@@ -187,7 +194,7 @@ def process_non_bdmv_folders(save_path, name, tags, tmdb_api_key):
         rclone_destination = "/home/boxbox/MyEmby/Remux/"
     else:
         rclone_destination = "/home/boxbox/MyEmby/Encode/"
-    
+
     rclone_command = [
         "rclone", "move",
         f"/home/boxbox/Emby/{name}/",
@@ -198,7 +205,7 @@ def process_non_bdmv_folders(save_path, name, tags, tmdb_api_key):
         f"--log-file={LOG_RCLONE_PATH}",
         "--delete-empty-src-dirs"
     ]
-    
+
     log(f"【执行命令2-rclone-媒体转移】 {' '.join(rclone_command)}")
     try:
         subprocess.run(rclone_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
@@ -218,7 +225,7 @@ def process_non_bdmv_folders(save_path, name, tags, tmdb_api_key):
             "--delete-empty-src-dirs",
             f"--log-file={LOG_WELLDONE_MOVE}"
         ]
-        
+
         log(f"【执行命令3-rclone-目录归档】 {' '.join(move_cmd)}")
         subprocess.run(move_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
         log(f"整套流程完毕 | 源：{move_src} | 归档目标：{target_finish}", "INFO")
